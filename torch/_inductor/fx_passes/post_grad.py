@@ -6,15 +6,14 @@ import logging
 import operator
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
-from typing import Any, TypeVar
-from typing_extensions import ParamSpec
+from typing import Any, cast, TypeVar
 
 import torch
 import torch._inductor as inductor
 import torch.utils._pytree as pytree
 from torch import fx
 from torch._decomp import register_decomposition
-from torch._dynamo.utils import counters
+from torch._dynamo.utils import counters, detect_fake_mode
 from torch._higher_order_ops.flex_gemm import _PRESERVE_FLEX_GEMM_GEMM_OP
 from torch._inductor.custom_graph_pass import (
     CustomInferenceAwareGraphPass,
@@ -25,6 +24,7 @@ from torch._logging import trace_structured
 from torch._prims_common import is_boolean_dtype, is_expandable_to, is_integer_dtype
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.utils._ordered_set import OrderedSet
+from typing_extensions import ParamSpec
 
 from .. import config, ir, pattern_matcher  # noqa: F401
 from ..codegen.common import custom_backend_passes
@@ -63,6 +63,11 @@ from ..virtualized import V
 from .b2b_gemm import B2B_GEMM_PASS
 from .control_dependencies import control_deps, preserve_node_ordering
 from .ddp_fusion import fuse_ddp_communication
+from .fx_graph_traversal_analysis_helpers import (
+    _same_size_stride_and_storage_offset,
+    collect_output_storage,
+    same_tensor_meta,
+)
 from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
 from .micro_pipeline_tp import micro_pipeline_tp_pass
 from .pre_grad import is_same_dict, save_inductor_dict
@@ -250,6 +255,10 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(gm, f"pass_pattern_{i}").apply_graph_pass(
                 patterns.apply
             )
+        if config.reuse_dtype_conversion_across_views:
+            GraphTransformObserver(
+                gm, "reuse_dtype_conversion_across_views"
+            ).apply_graph_pass(reuse_dtype_conversion_across_views)
         if config.partitioned_scatter_enabled:
             GraphTransformObserver(
                 gm, "partitioned_scatter_optimization"
@@ -1185,29 +1194,6 @@ def is_valid_splitwithsizes_cat(match):
     return True
 
 
-def same_meta(node1: torch.fx.Node, node2: torch.fx.Node):
-    """True if two nodes have the same metadata"""
-    val1 = node1.meta.get("val")
-    val2 = node2.meta.get("val")
-    return (
-        val1 is not None
-        and val2 is not None
-        and isinstance(val1, torch.Tensor)
-        and isinstance(val2, torch.Tensor)
-        and statically_known_true(sym_eq(val1.size(), val2.size()))
-        and val1.layout == val2.layout
-        and val1.dtype == val2.dtype
-        and val1.device == val2.device
-        and (
-            val1.layout != torch.strided
-            or statically_known_true(sym_eq(val1.stride(), val2.stride()))
-        )
-        # Check conjugate and negative bits - a clone that resolves these is not a no-op
-        and val1.is_conj() == val2.is_conj()
-        and val1.is_neg() == val2.is_neg()
-    )
-
-
 noop_registry: dict[Any, Any] = {}
 
 
@@ -1334,22 +1320,13 @@ def remove_noop_ops(graph: torch.fx.Graph):
     """
     inputs = OrderedSet[torch.fx.Node]()
     input_storages = OrderedSet[int | None]()
-    output_storages = OrderedSet[int | None]()
 
     for node in graph.find_nodes(op="placeholder"):
         inputs.add(node)
         input_storages.add(get_node_storage(node))
 
-    output_node = next(iter(reversed(graph.nodes)))
-    if output_node.op != "output":
-        raise AssertionError(f"expected output node, got {output_node.op}")
-    outputs = output_node.args[0]
-    if not isinstance(outputs, (list, tuple)):
-        # nested subgraphs can have singleton outputs
-        outputs = (outputs,)
-    for out in outputs:
-        if isinstance(out, torch.fx.Node):
-            output_storages.add(get_node_storage(out))
+    output_node = graph.output_node()
+    output_storages = collect_output_storage(graph)
 
     for node in graph.nodes:
         if node.target in noop_registry:
@@ -1395,9 +1372,168 @@ def remove_noop_ops(graph: torch.fx.Graph):
             is_valid, args, kwargs = get_fake_args_kwargs(node)
             if not is_valid:
                 continue
-            if same_meta(node, src) and cond(*args, **kwargs):
+            node_val = node.meta.get("val")
+            src_val = src.meta.get("val")
+            if (
+                isinstance(node_val, torch.Tensor)
+                and isinstance(src_val, torch.Tensor)
+                and same_tensor_meta(node_val, src_val)
+                and cond(*args, **kwargs)
+            ):
                 node.replace_all_uses_with(src)
                 graph.erase_node(node)
+
+
+def _same_dense_storage_region(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+    lhs_val = cast(torch.Tensor, lhs.meta["val"])
+    rhs_val = cast(torch.Tensor, rhs.meta["val"])
+    return (
+        get_node_storage(lhs) is not None
+        and get_node_storage(lhs) == get_node_storage(rhs)
+        and torch._prims_common.is_non_overlapping_and_dense_or_false(lhs_val)
+        and torch._prims_common.is_non_overlapping_and_dense_or_false(rhs_val)
+        and statically_known_true(sym_eq(lhs_val.numel(), rhs_val.numel()))
+        and statically_known_true(
+            sym_eq(lhs_val.storage_offset(), rhs_val.storage_offset())
+        )
+        and not lhs_val.is_conj()
+        and not lhs_val.is_neg()
+        and not rhs_val.is_conj()
+        and not rhs_val.is_neg()
+    )
+
+
+def _replay_view(
+    view: torch.fx.Node, old: torch.fx.Node, new: torch.Tensor
+) -> torch.Tensor:
+    args, kwargs = pytree.tree_map(
+        lambda value: (
+            new
+            if value is old
+            else value.meta["val"]
+            if isinstance(value, torch.fx.Node)
+            else value
+        ),
+        (view.args, view.kwargs),
+    )
+    fake_mode = detect_fake_mode((args, kwargs))
+    if fake_mode is None:
+        raise AssertionError("expected FakeTensor inputs")
+    with fake_mode:
+        return view.target(*args, **kwargs)
+
+
+def reuse_dtype_conversion_across_views(graph: torch.fx.Graph) -> None:
+    """Reuse dtype conversions of dense aliases covering the same storage region."""
+    # Skip if the graph contains mutation beyond the copy_ output epilogue.
+    if graph.find_nodes(op="call_function", target=aten.set_.default):
+        return
+
+    output_storages = collect_output_storage(graph)
+
+    # Index all conversions by (input storage ID, source dtype, destination dtype).
+    conversions_by_storage: defaultdict[
+        tuple[int, torch.dtype, torch.dtype], list[torch.fx.Node]
+    ] = defaultdict(list)
+    convert = prims.convert_element_type.default
+    for conversion in graph.find_nodes(op="call_function", target=convert):
+        source = cast(torch.fx.Node, get_arg_value(conversion, 0, "a"))
+        source_val = source.meta.get("val")
+        conversion_val = conversion.meta.get("val")
+        source_storage = get_node_storage(source)
+        conversion_storage = get_node_storage(conversion)
+        if not (
+            isinstance(source_val, torch.Tensor)
+            and isinstance(conversion_val, torch.Tensor)
+            and source_storage is not None
+            and conversion_storage is not None
+            # Skip conversions whose storage reaches a graph output.
+            and conversion_storage not in output_storages
+            # Replaying the source view after conversion requires the conversion
+            # to preserve the source's element layout.
+            and _same_size_stride_and_storage_offset(source_val, conversion_val)
+        ):
+            continue
+        conversions_by_storage[
+            (source_storage, source_val.dtype, conversion_val.dtype)
+        ].append(conversion)
+
+    rewrites = 0
+    for conversions in conversions_by_storage.values():
+        base_conversions: list[torch.fx.Node] = []
+        for conversion in conversions:
+            source = cast(torch.fx.Node, get_arg_value(conversion, 0, "a"))
+            base_conversion = next(
+                (
+                    base_conversion
+                    for base_conversion in base_conversions
+                    if _same_dense_storage_region(
+                        cast(
+                            torch.fx.Node,
+                            get_arg_value(base_conversion, 0, "a"),
+                        ),
+                        source,
+                    )
+                    and (
+                        source is get_arg_value(base_conversion, 0, "a")
+                        or get_arg_value(base_conversion, 0, "a")
+                        in source.all_input_nodes
+                    )
+                ),
+                None,
+            )
+            if base_conversion is None:
+                base_conversions.append(conversion)
+                continue
+
+            base_source = cast(torch.fx.Node, get_arg_value(base_conversion, 0, "a"))
+            if source is base_source:
+                replacement = base_conversion
+            else:
+                if not (
+                    source.op == "call_function"
+                    and isinstance(source.target, torch._ops.OpOverload)
+                    and source.target.namespace == "aten"
+                ):
+                    continue
+                base_conversion_val = cast(torch.Tensor, base_conversion.meta["val"])
+                replacement_val = _replay_view(source, base_source, base_conversion_val)
+                if (
+                    get_node_storage(base_conversion)
+                    != replacement_val.untyped_storage()._cdata
+                ):
+                    continue
+                replacement_args, replacement_kwargs = pytree.tree_map(
+                    lambda value: base_conversion if value is base_source else value,
+                    (source.args, source.kwargs),
+                )
+                with graph.inserting_before(conversion):
+                    replacement = graph.call_function(
+                        source.target, replacement_args, replacement_kwargs
+                    )
+                replacement.meta = conversion.meta.copy()
+                replacement.meta["val"] = replacement_val
+
+            if not same_tensor_meta(
+                cast(torch.Tensor, replacement.meta["val"]), conversion_val
+            ):
+                if replacement is not base_conversion:
+                    graph.erase_node(replacement)
+                continue
+            conversion.replace_all_uses_with(replacement)
+            graph.erase_node(conversion)
+
+            pending = [source]
+            while pending:
+                unused = pending.pop()
+                if unused.op != "call_function" or unused.users:
+                    continue
+                pending.extend(unused.all_input_nodes)
+                graph.erase_node(unused)
+            rewrites += 1
+
+    if rewrites:
+        counters["inductor"]["reuse_dtype_conversion_across_views"] += rewrites
 
 
 def remove_assert_ops(graph: torch.fx.Graph):
@@ -2401,11 +2537,13 @@ class ConstructorMoverPass:
                     gpu_node = graph.call_function(operator.getitem, (gpu_split, idx))
                     node.replace_all_uses_with(
                         gpu_node,
-                        lambda x: x
-                        not in [cpu_concat, gpu_concat, gpu_split, gpu_node]
-                        + unsqueezed_nodes
-                        and x.target != torch.ops.aten.copy_.default
-                        and x.target != "output",
+                        lambda x: (
+                            x
+                            not in [cpu_concat, gpu_concat, gpu_split, gpu_node]
+                            + unsqueezed_nodes
+                            and x.target != torch.ops.aten.copy_.default
+                            and x.target != "output"
+                        ),
                     )
                     last_node = gpu_node
 
