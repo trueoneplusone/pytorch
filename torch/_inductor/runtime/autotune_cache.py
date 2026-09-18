@@ -705,6 +705,17 @@ def _load_cached_autotuning(
     # to restore custom tuned options from the cache.
     extra_options = best_config.pop("extra_options", None)
 
+    # Reject cached configs that violate a runtime reduction-block lower bound
+    # before either the direct-match or reconstructed-config path can return it.
+    min_rblock = inductor_meta.get("min_rblock")
+    cached_r0_block = best_config.get("R0_BLOCK")
+    if (
+        min_rblock is not None
+        and isinstance(cached_r0_block, int)
+        and cached_r0_block < min_rblock
+    ):
+        return None
+
     found_by_coordesc = inductor_meta.get(
         "coordinate_descent_tuning"
     ) and best_config.pop("found_by_coordesc", False)

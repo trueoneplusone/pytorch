@@ -712,7 +712,14 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             inductor_meta=inductor_meta,
             triton_meta=triton_meta,
         )
-        min_rblock = inductor_meta.get("min_split_scan_rblock", 256)
+        min_rblock = max(
+            inductor_meta.get("min_split_scan_rblock", 256),
+            inductor_meta.get("min_rblock") or 0,
+        )
+        # Split-scan workspace is sized assuming this lower bound. Propagate
+        # the same contract to coordinate descent so it cannot later shrink
+        # R0_BLOCK below the allocation used by codegen.
+        inductor_meta["min_rblock"] = min_rblock
         for cfg in configs:
             for var in list(cfg.kwargs.keys()):  # type: ignore[union-attr]
                 if var.startswith("R") and cfg.kwargs[var] < min_rblock:  # type: ignore[union-attr]
