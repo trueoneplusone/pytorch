@@ -184,7 +184,8 @@ deprecation cycle.
        made, or the only call raised and was caught -- raises ``PrecompileError`` instead
        of writing an empty artifact.
    :raises PrecompileError: if capture, lowering, or a runtime call violates the
-       contract (see the exception below); if ``tracer`` is a
+       contract (see the exception below); if one of the two paths is handed artifact
+       contents rather than a path; if ``tracer`` is a
        :class:`precompile.DynamoTracer` (not available in this build yet); if the block
        exits cleanly with nothing captured (no call was made, or the only call raised),
        so there is nothing to write; a second make_fx call also raises.
@@ -228,7 +229,7 @@ deprecation cycle.
 ```
 
 ```{eval-rst}
-.. py:function:: precompile.load(artifact_path, cache_path, /)
+.. py:function:: precompile.load(artifact_path, cache_path, /, *, fn=None)
 
    Reconstruct a runnable from the two files a precompile capture wrote -- the
    ``python_code`` artifact and its ``cache``. They load only as a matched pair (the cache
@@ -257,6 +258,12 @@ deprecation cycle.
        :func:`precompile.capture` (or by :meth:`precompile.Capture.save`).
    :param cache_path: File holding ``cache``, as written by
        :func:`precompile.capture` (or by :meth:`precompile.Capture.save`).
+   :param fn: For a dynamo artifact that serves by installing onto live code objects,
+       the function object to install onto, when it is not importable from where it was
+       captured (e.g. defined in ``__main__`` or a notebook); pass it before the first
+       call. A standalone artifact rejects ``fn=`` with ``PrecompileError``, and since
+       every artifact this build can produce is standalone, ``fn=`` is not available
+       here: ``load`` refuses it unconditionally.
    :returns: A :class:`torch.compiler.PrecompiledRunnable` with the same calling
        convention as the captured ``fn``. A make_fx artifact takes positional arguments
        only; a dynamo artifact also accepts keyword arguments, the way the
@@ -268,15 +275,20 @@ deprecation cycle.
        reachable from the entry -- including one that graph-broke or recompiled only
        within the entry frame -- is standalone: it installs nothing, and its ``with`` /
        ``unload()`` are no-ops. Both expose the same surface, and ``installed`` (``True``
-       for the installing shape, ``False`` for standalone) tells them apart. Which one you
-       get is a property of the capture, not a load-time choice; the installing shape
-       arrives with :class:`precompile.DynamoTracer`.
+       for the installing shape, ``False`` for standalone) tells them apart. Which one
+       you get is a property of the capture, not a load-time choice. The installing
+       shape arrives with :class:`precompile.DynamoTracer` and is not available in this
+       build yet (``load`` raises ``PrecompileError`` for an artifact whose
+       ``SERVING_MODE`` is ``'installed'``).
    :raises PrecompileError: if either half cannot be read (a missing or unreadable file,
-       or the two paths swapped -- the cache's bytes then fail to decode as source); if
-       ``python_code`` is not a valid precompile artifact (it fails to parse or is
-       missing its calling-convention metadata); if ``cache`` is paired with a different
-       ``python_code`` (mismatched ``backend`` tag or ``code_hash``); or if a runtime
-       call violates the precompile contract.
+       one of the two paths handed artifact contents rather than a path, or the two paths
+       swapped -- the cache's bytes then fail to decode as source); if ``python_code`` is
+       not a valid precompile artifact (it fails to parse or is missing its
+       calling-convention metadata); if ``cache`` is paired with a different
+       ``python_code`` (mismatched ``backend`` tag, ``tracer`` tag, or ``code_hash``); if
+       the artifact declares ``SERVING_MODE = 'installed'`` or ``fn=`` is passed (neither
+       is available in this build); or if a runtime call violates the precompile
+       contract.
    :raises ValueError: for one file named as both halves, or for a path that exists but
        is not a regular file. These are checked before either file is opened.
 
