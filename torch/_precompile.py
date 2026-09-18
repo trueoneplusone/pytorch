@@ -261,6 +261,27 @@ it.
 # (artifact=None) but is still a full integrity-tagged envelope (python_code is the
 # whole runnable artifact).
 #
+# autocast: a served call IGNORES the serving process's ambient autocast -- the emitted
+# drivers neutralize it, for the duration of the call, on every autocast-capable device
+# of the SERVING build (torch._C._autocast_supported_devices(), the device list
+# torch._functorch._aot_autograd.graph_capture_wrappers.disable_autocast neutralizes
+# over, whose loop the driver inlines) -- because whatever the capture ran under is
+# already baked in (ATen casts for make_fx, compiled kernels for inductor), so
+# re-dispatching under an ambient autocast would cast a second time. A served call
+# returns the capture's dtypes, not the dtypes the same eager call returns inside that
+# region, so capture under the autocast you want baked in. From the serving build rather
+# than from a per-artifact device tag: the captured graph does not name the devices an
+# op reaches only inside its own body, and there is no metadata field or parse path to
+# keep compatible. The disable is entered only for a device that actually has autocast
+# on, so a served call with no ambient region constructs nothing and pays one probe per
+# supported device (a few microseconds per served call, against well under one for a
+# one-device artifact tag). A device that reports autocast enabled and then refuses to
+# construct the disable (a
+# module registered under the privateuse1 backend name and missing
+# get_amp_supported_dtype -- the only device whose module the autocast constructor
+# consults) is skipped, with one logged warning per device per loaded artifact: that is
+# the one case where a served call still casts twice.
+#
 # tracer: the capture front-end, orthogonal to backend. "make_fx" (default) is a
 # non-strict trace and is the only tracer implemented today -- everything above (the
 # invariants, the contract) describes its behavior. "dynamo" is planned (a Dynamo-based
@@ -427,10 +448,10 @@ class Capture:
     capture, call it with the positional arguments ``fn`` takes inside the block
     (keyword arguments are refused) -- each call runs for real, is folded into the
     capture, and returns what serving the artifact produces (:func:`capture` has
-    the ``requires_grad`` contract of that served value) -- and the artifact is
-    written to the ``artifact_path`` / ``cache_path`` files when the block exits
-    CLEANLY: a block that RAISED writes nothing, and a clean exit that never called
-    the capture raises instead of writing. Call :meth:`save` inside the block to
+    the ``requires_grad`` and autocast contracts of that served value) -- and the
+    artifact is written to the ``artifact_path`` / ``cache_path`` files when the block
+    exits CLEANLY: a block that RAISED writes nothing, and a clean exit that never
+    called the capture raises instead of writing. Call :meth:`save` inside the block to
     checkpoint everything captured so far to those same files without ending the
     capture. The object is single-shot: the block is entered once, calling outside
     it is refused, and so is saving -- except to retry a WRITE that failed.
@@ -1777,7 +1798,9 @@ _GENERATED_HEADER = """\
 # make_fx trace, so control flow and shapes are specialized to the example inputs,
 # and (inductor backend) each input's stride / memory format is baked too: pass
 # runtime inputs in the example's layout (.contiguous() to match a contiguous
-# example). See Note [precompile programming model] in torch/_precompile.py.
+# example). The capture's autocast is baked in too: a call through this file
+# neutralizes any autocast the calling process has on and returns the capture's
+# dtypes. See Note [precompile programming model] in torch/_precompile.py.
 #
 # It contains, in order:
 #   1. The composed graph module from aot_autograd.compile_to_python: the inlined
@@ -1787,7 +1810,8 @@ _GENERATED_HEADER = """\
 #      exposing ``call(flat_inputs) -> outputs``.
 #   2. Calling-convention metadata.
 #   3. A small driver that extracts each runtime module's params/buffers (in the
-#      same order as capture), passes them with the runtime inputs to ``call``, and
+#      same order as capture), passes them with the runtime inputs to ``call`` with
+#      the caller's autocast neutralized on every autocast-capable device, and
 #      scatters any harvested gradients onto the model's .grad fields. No model
 #      weights are embedded (you bring the model).
 #
@@ -1928,10 +1952,12 @@ def _parse_artifact_metadata(python_code: str) -> dict[str, object]:
                     f"malformed; it must be a Python literal."
                 ) from e
         else:
-            # Not a metadata name we consume: the inlined graph section declares module-level
-            # names of its own (aten, async_compile, the kernel handles, call), so this fires
-            # many times on an inductor artifact. Skipped by design, but logged at debug so a
-            # malformed / renamed artifact is diagnosable rather than silently lost.
+            # Not a metadata name we consume: the inlined graph section declares
+            # module-level names of its own (aten, async_compile, the kernel handles,
+            # call), as does the driver section (_AUTOCAST_SKIPS_REPORTED), so this
+            # fires many times on an inductor artifact. Skipped by design, but logged
+            # at debug so a malformed / renamed artifact is diagnosable rather than
+            # silently lost.
             log.debug(
                 "precompile: ignoring unrecognized top-level assignment %r while "
                 "parsing artifact calling-convention metadata",
@@ -1986,6 +2012,8 @@ _EAGER_GENERATED_HEADER = """\
 #
 # The runtime model must be structurally identical to the traced one (only weight
 # VALUES may differ), and control flow / shapes are specialized to the example inputs.
+# The driver below neutralizes any autocast the calling process has on, on every
+# autocast-capable device, so a call returns the capture's dtypes.
 # See Note [precompile programming model] in torch/_precompile.py for the full contract.
 """
 
@@ -2061,9 +2089,13 @@ def _emit_driver_source(forward_fn_name: str) -> str:
 
     forward_fn = getattr(driver, forward_fn_name)
     blocks = [
+        # _autocast_off's report-once state: module level, so out of getsource's
+        # reach. The name must match the one the driver declares.
+        "_AUTOCAST_SKIPS_REPORTED = set()",
         inspect.getsource(driver._extract_param_buffers),
         inspect.getsource(driver._fail),
         inspect.getsource(driver._check_structure),
+        inspect.getsource(driver._autocast_off),
         inspect.getsource(forward_fn).replace(
             f"def {forward_fn_name}(", "def forward(", 1
         ),
@@ -2805,11 +2837,13 @@ def capture(
     from the runtime input, inductor from the capture), so set it yourself if you depend
     on it. ``backend`` picks ``"inductor"`` (lower through AOTAutograd + Inductor into
     self-contained source plus an acceleration cache) or ``"eager"`` (inline the captured
-    ATen graph as readable source). Call ``cap.save()`` inside the block to write the
-    files before it exits; after a WRITE that failed -- the exit's or a ``save()``'s --
-    call it again to retry that write, from outside the block too. The contract is Note
-    [precompile programming model] in this module; see :func:`load` for reading the pair
-    back.
+    ATen graph as readable source). A call served from the artifact IGNORES the serving
+    process's ambient autocast, since the casts the capture ran under are already baked
+    in, so capture under the autocast you want baked in. Call ``cap.save()`` inside the
+    block to write the files before it exits; after a WRITE that failed -- the exit's or
+    a ``save()``'s -- call it again to retry that write, from outside the block too. The
+    contract is Note [precompile programming model] in this module; see :func:`load` for
+    reading the pair back.
 
     Raises ``ValueError`` for a ``backend`` outside ``{"inductor", "eager"}`` and for a
     path pair no entry point can use (half a pair, one file named for both halves, a path
@@ -3056,6 +3090,23 @@ class _PrecompileApi:
         ``TracingContext`` fake mode outranks capture's own and does not carry its
         fallback-off setting), and -- for the inductor backend -- a runtime input whose
         stride / memory format differs from the example's (invariant 6).
+
+        A call served from the artifact IGNORES the serving process's ambient autocast:
+        whatever the capture ran under is already baked in (ATen casts for ``"eager"``,
+        compiled kernels for ``"inductor"``), so re-dispatching under an ambient
+        ``autocast`` region would cast a second time. The reloaded callable therefore
+        returns the capture's dtypes, NOT the dtypes the same eager call returns inside
+        that region -- so capture under the autocast you want baked in. Autocast is
+        neutralized for the duration of the call on every device this build can autocast
+        (``torch._C._autocast_supported_devices()``), not just the ones the captured
+        graph names, so an op that moves work to another device inside its own body is
+        covered too; a device with no ambient autocast on it costs a probe and nothing
+        else. A device that REPORTS autocast enabled and whose disable then refuses to
+        construct -- a module registered under the privateuse1 backend name and missing
+        ``get_amp_supported_dtype``, the only device whose module the ``autocast``
+        constructor consults -- is skipped rather than failed on, with one logged warning
+        per device per loaded artifact: that is the one case where a served call still
+        casts twice.
         """
         torch._C._log_api_usage_once("torch.compiler.precompile")
         if backend not in ("inductor", "eager"):
@@ -3104,6 +3155,10 @@ class _PrecompileApi:
         precompile captures. A cache whose ``format``/``version`` does not match (a
         foreign or different-build envelope) is NOT fatal: the cache is acceleration
         only, so ``load`` degrades to JIT'ing from ``python_code`` rather than crashing.
+
+        Calling the result IGNORES this process's ambient autocast on every device this
+        build can autocast, so it returns the capture's dtypes; see
+        ``torch.compiler.precompile``'s docstring for the full contract.
         """
         return _runnable_from_pair(
             python_code, cache, who="torch.compiler.precompile.load"

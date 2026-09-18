@@ -81,8 +81,17 @@ For a quick overview of `torch.compiler`, see {ref}`torch.compiler_overview`.
       and fails if the computation must guard on that value (or if the op is one no
       ``ShapeEnv`` can fake, e.g. ``aten.equal``). Each input's dtype and device are
       specialized too (a runtime mismatch is rejected), and the inductor backend
-      additionally specializes on input memory format. See Note [precompile programming
-      model] in ``torch/_precompile.py``. ``torch.compiler.precompile`` is distinct from
+      additionally specializes on input memory format. A call served from the reloaded
+      artifact also IGNORES the serving process's ambient ``torch.autocast``: whatever
+      the capture ran under is already baked in, so autocast is neutralized for the
+      duration of the call on every device this build can autocast, and the call returns
+      the capture's dtypes, not the dtypes the same eager call returns inside that region
+      -- so capture under the autocast you want baked in. The one case that still casts
+      twice is a device that reports autocast enabled and whose disable then refuses to
+      construct (a module registered under the privateuse1 backend name and missing
+      ``get_amp_supported_dtype``); it is skipped with one logged warning per device per
+      loaded artifact. See Note [precompile programming model] in
+      ``torch/_precompile.py``. ``torch.compiler.precompile`` is distinct from
       ``torch._dynamo.config.caching_precompile`` (a ``torch.compile`` caching mode).
 
    If ``fn`` runs a backward, the artifact re-runs the whole forward and backward and
@@ -127,6 +136,10 @@ For a quick overview of `torch.compiler`, see {ref}`torch.compiler_overview`.
    source of truth); ``cache`` only accelerates loading -- it carries only the compiled
    backend artifact (the Inductor bundle for ``backend="inductor"``; empty for
    ``backend="eager"``) and no weights. You pass the model(s) again at runtime.
+   Calling the result ignores this process's ambient ``torch.autocast`` on every device
+   this build can autocast, so it returns the capture's dtypes rather than the dtypes the
+   same eager call returns inside that region (see the autocast contract in the note
+   above).
 
    .. warning::
 
