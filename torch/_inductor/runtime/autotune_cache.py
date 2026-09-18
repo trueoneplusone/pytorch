@@ -731,6 +731,14 @@ def _load_cached_autotuning(
     # that aren't in the original config list.
     best_config.pop("found_by_coordesc", None)
     triton_config = _reconstruct_triton_config(best_config, extra_options)
+
+    min_rblock = inductor_meta.get("min_rblock")
+    if (
+        min_rblock is not None
+        and triton_config.kwargs.get("R0_BLOCK", min_rblock) < min_rblock
+    ):
+        return None
+
     if found_by_coordesc:
         # pyrefly: ignore [missing-attribute]
         triton_config.found_by_coordesc = True

@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import torch
+from torch._inductor.heuristics.triton_codegen.reduction import ReductionHeuristic
 from torch._inductor.runtime import triton_heuristics
 from torch._inductor.runtime.hints import (
     native_matmul_block_numel,
@@ -333,6 +334,45 @@ class TestCoordinateDescentTuner(TestCase):
         self.assertFalse(tuner.value_too_small("R0_BLOCK", 64))
         self.assertEqual(tuner.get_neighbour_values("XBLOCK", 16), [32])
         self.assertEqual(tuner.get_neighbour_values("R0_BLOCK", 64), [128])
+
+    def test_split_scan_propagates_rblock_minimum_to_coordesc(self):
+        heuristic = ReductionHeuristic()
+        size_hints = {"x": 8192, "r0_": 2048}
+
+        for existing_min, expected_min in ((None, 256), (512, 512)):
+            with self.subTest(existing_min=existing_min):
+                inductor_meta = {"min_split_scan_rblock": 256}
+                if existing_min is not None:
+                    inductor_meta["min_rblock"] = existing_min
+
+                initial = triton.Config(
+                    {"XBLOCK": 1, "R0_BLOCK": 128},
+                    num_warps=4,
+                    num_stages=1,
+                )
+                with mock.patch.object(
+                    heuristic,
+                    "get_configs",
+                    return_value=[initial],
+                ):
+                    configs = heuristic.get_split_scan_configs(
+                        size_hints=size_hints,
+                        inductor_meta=inductor_meta,
+                        triton_meta={},
+                    )
+
+                self.assertEqual(inductor_meta["min_rblock"], expected_min)
+                self.assertEqual(configs[0].kwargs["R0_BLOCK"], expected_min)
+
+                tuner = CoordescTuner(
+                    size_hints=size_hints,
+                    inductor_meta=inductor_meta,
+                )
+                neighbours = tuner.get_neighbour_configs(configs[0], "R0_BLOCK")
+                self.assertTrue(neighbours)
+                self.assertTrue(
+                    all(cfg.kwargs["R0_BLOCK"] >= expected_min for cfg in neighbours)
+                )
 
     def test_tma_minimum_block_sizes(self):
         tuner = CoordescTuner(

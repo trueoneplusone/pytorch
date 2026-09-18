@@ -1639,6 +1639,55 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
         autotuner._dynamic_scale_rblock()
 
     @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_load_cached_autotuning_rejects_rblock_below_minimum(self):
+        from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
+        from torch._inductor.runtime.triton_heuristics import hash_configs
+
+        original_configs = [
+            triton.Config(
+                {"XBLOCK": 1, "R0_BLOCK": 256},
+                num_warps=4,
+                num_stages=1,
+            )
+        ]
+        configs_hash = hash_configs(original_configs)
+
+        for found_by_coordesc in (False, True):
+            for min_rblock, rblock, should_load in (
+                (None, 128, True),
+                (256, 128, False),
+                (256, 256, True),
+                (512, 256, False),
+            ):
+                with self.subTest(
+                    found_by_coordesc=found_by_coordesc,
+                    min_rblock=min_rblock,
+                    rblock=rblock,
+                ):
+                    best_config_data = {
+                        "XBLOCK": 1,
+                        "R0_BLOCK": rblock,
+                        "num_warps": 4,
+                        "num_stages": 1,
+                        "configs_hash": configs_hash,
+                        "found_by_coordesc": found_by_coordesc,
+                        "time_taken_ms": 1,
+                    }
+
+                    inductor_meta = {"coordinate_descent_tuning": True}
+                    if min_rblock is not None:
+                        inductor_meta["min_rblock"] = min_rblock
+
+                    result = _load_cached_autotuning(
+                        best_config_data,
+                        configs_hash,
+                        original_configs,
+                        inductor_meta,
+                    )
+
+                    self.assertEqual(result is not None, should_load)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
     def test_load_cached_autotuning_reconstructs_unknown_config(self):
         """
         When the cached best config is not in the original configs list
